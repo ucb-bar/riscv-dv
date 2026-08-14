@@ -213,6 +213,14 @@ class riscv_privileged_common_seq extends uvm_sequence;
     instrs.push_back($sformatf("and x%0d, x%0d, x%0d", cfg.gpr[0], cfg.gpr[0], cfg.gpr[1]));
     // Set the PPN field for SATP
     instrs.push_back($sformatf("csrs 0x%0x, x%0d # satp", SATP, cfg.gpr[0]));
+    // Writing satp does not imply that translation caches are invalidated - the
+    // privileged spec is explicit that an SFENCE.VMA is required after it - so
+    // without this the program depends on unspecified caching behaviour. Spike
+    // flushes its TLB on every satp write, BOOM only on an executed sfence.vma;
+    // both are compliant, so the cosim reports a divergence on a difference the
+    // test itself created. One flush here makes the program well-formed instead
+    // of teaching the checker to tolerate it.
+    instrs.push_back("sfence.vma");
   endfunction
 
 endclass
