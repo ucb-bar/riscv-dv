@@ -1421,11 +1421,27 @@ package riscv_instr_pkg;
         instr.push_back($sformatf("andi x%0d, x%0d, 0x3", tp, tp)); // keep the MPP bits
         // Check if MPP equals to M-mode('b11)
         instr.push_back($sformatf("xori x%0d, x%0d, 0x3", tp, tp));
-        instr.push_back($sformatf("bnez x%0d, 1f", tp));      // Use physical address for kernel SP
+        // MPP == M: loads/stores in the handler are M-mode accesses whatever
+        // MPRV says, so the kernel stack is reached by physical address.
+        instr.push_back($sformatf("beqz x%0d, 1f", tp));
+        // MPP is S/U, but that alone does not redirect the handler's accesses -
+        // MPRV must also be set. With MPRV == 0 the handler still accesses
+        // memory as M-mode, so the physical address is again the correct one.
+        instr.push_back($sformatf("csrr x%0d, 0x%0x // MSTATUS", tp, status));
+        instr.push_back($sformatf("slli x%0d, x%0d, %0d", tp, tp, XLEN - 18));
+        instr.push_back($sformatf("srli x%0d, x%0d, %0d", tp, tp, XLEN - 1));
+        instr.push_back($sformatf("beqz x%0d, 1f", tp));
         // Use virtual address for stack pointer
         instr.push_back($sformatf("slli x%0d, x%0d, %0d", sp, sp, XLEN - MAX_USED_VADDR_BITS));
         instr.push_back($sformatf("srli x%0d, x%0d, %0d", sp, sp, XLEN - MAX_USED_VADDR_BITS));
         instr.push_back("1: nop");
+        // tp was borrowed as the scratch for the checks above and still holds a
+        // comparison result. Restore it to the kernel stack pointer *before* the
+        // 31 stores below, not just after them: a fault part-way through the
+        // prologue otherwise leaves tp holding 0, and every later trap entry
+        // then does addi tp,tp,-8 on 0 and faults again, forever. The final
+        // "Move KSP back to gpr.TP" below still sets the value pop expects.
+        instr.push_back($sformatf("add x%0d, x%0d, zero", tp, sp));
       end
     end
     // Push all GPRs (except for x0) to kernel stack
