@@ -977,6 +977,7 @@ class riscv_asm_program_gen extends uvm_object;
     gen_ebreak_handler(hart);
     // Illegal instruction handler
     gen_illegal_instr_handler(hart);
+    gen_data_fault_handler(hart);
     // Generate page table fault handling routine
     // Page table fault is always handled in machine mode, as virtual address translation may be
     // broken when page fault happens.
@@ -1100,6 +1101,19 @@ class riscv_asm_program_gen extends uvm_object;
              $sformatf("li x%0d, 0x%0x # ILLEGAL_INSTRUCTION", cfg.gpr[1], ILLEGAL_INSTRUCTION),
              $sformatf("beq x%0d, x%0d, %0sillegal_instr_handler",
                        cfg.gpr[0], cfg.gpr[1], hart_prefix(hart)),
+             // Misaligned loads and stores. Causes 1, 5 and 7 already have
+             // handlers above; 4 and 6 had none, so they fell through to the
+             // test_done jump below and the first misaligned access ended the
+             // program with a PASS - while the campaign enables
+             // enable_unaligned_load_store precisely to generate them.
+             $sformatf("li x%0d, 0x%0x # LOAD_ADDRESS_MISALIGNED", cfg.gpr[1],
+                       LOAD_ADDRESS_MISALIGNED),
+             $sformatf("beq x%0d, x%0d, %0sdata_fault_handler",
+                       cfg.gpr[0], cfg.gpr[1], hart_prefix(hart)),
+             $sformatf("li x%0d, 0x%0x # STORE_AMO_ADDRESS_MISALIGNED", cfg.gpr[1],
+                       STORE_AMO_ADDRESS_MISALIGNED),
+             $sformatf("beq x%0d, x%0d, %0sdata_fault_handler",
+                       cfg.gpr[0], cfg.gpr[1], hart_prefix(hart)),
              // Skip checking tval for illegal instruction as it's implementation specific
              $sformatf("csrr x%0d, 0x%0x # %0s", cfg.gpr[1], tval, tval.name()),
              // use JALR to jump to test_done.
@@ -1197,6 +1211,55 @@ class riscv_asm_program_gen extends uvm_object;
   // 4 and resumes execution. The way that the illegal instruction is injected guarantees that
   // PC + 4 is a valid instruction boundary.
   // TODO: handshake the corret Xcause CSR based on delegation setup
+  // Resume past a load/store that faulted, instead of ending the test.
+  //
+  // Skips by the instruction's real length: on an RVC target instructions are
+  // 2-byte aligned but 2 or 4 bytes long, so a fixed mepc += 4 lands two bytes
+  // inside the next instruction whenever the faulting one was compressed. That
+  // raises no fetch exception, it just resumes mid-instruction and executes
+  // whatever the halves decode as - measured to wander out of the generated
+  // stream, write cfg.tp, and livelock the handler on its own prologue.
+  //
+  // Reading the halfword at mepc needs the trapping mode's translation, since
+  // mepc is a virtual address whenever the trap came from S/U with satp set.
+  // mstatus.MPRV makes this M-mode load use exactly that mode - one path for M, S
+  // and U, hardcoding no address map.
+  //
+  // MPRV is set and cleared with csrrs/csrrc, touching that one bit atomically,
+  // rather than saving mstatus and writing the whole register back. With
+  // enable_nested_interrupt an interrupt can be taken between the two writes, and
+  // a blind whole-register restore would then discard the MPP/MPIE that trap had
+  // just saved, leaving the machine in a state cospike cannot model.
+  //
+  // If the load itself page-faults on a deliberately-illegal PTE, cause 13 is
+  // dispatched to pt_fault_handler, which repairs the PTE and returns here, so the
+  // nested fault is self-healing.
+  virtual function void gen_data_fault_handler(int hart);
+    string instr[$];
+    gen_signature_handshake(.instr(instr), .signature_type(WRITE_CSR), .csr(MCAUSE));
+    instr = {instr,
+            $sformatf("li    x%0d, 0x%0x", cfg.gpr[1], 'h20000),   // MSTATUS.MPRV
+            $sformatf("csrrs x0, 0x%0x, x%0d", MSTATUS, cfg.gpr[1]),
+            $sformatf("csrr  x%0d, 0x%0x", cfg.gpr[0], MEPC),
+            $sformatf("lhu   x%0d, 0(x%0d)", cfg.gpr[0], cfg.gpr[0]),
+            $sformatf("csrrc x0, 0x%0x, x%0d", MSTATUS, cfg.gpr[1]),
+            // 0b11 in the low two bits means a 4-byte instruction.
+            $sformatf("andi  x%0d, x%0d, 0x3", cfg.gpr[0], cfg.gpr[0]),
+            $sformatf("addi  x%0d, x%0d, -3", cfg.gpr[0], cfg.gpr[0]),
+            $sformatf("csrr  x%0d, 0x%0x", cfg.gpr[1], MEPC),
+            $sformatf("bnez  x%0d, 1f", cfg.gpr[0]),
+            $sformatf("addi  x%0d, x%0d, 4", cfg.gpr[1], cfg.gpr[1]),
+            "j 2f",
+            "1:",
+            $sformatf("addi  x%0d, x%0d, 2", cfg.gpr[1], cfg.gpr[1]),
+            "2:",
+            $sformatf("csrw  0x%0x, x%0d", MEPC, cfg.gpr[1])
+    };
+    pop_gpr_from_kernel_stack(MSTATUS, MSCRATCH, cfg.mstatus_mprv, cfg.sp, cfg.tp, instr);
+    instr.push_back("mret");
+    gen_section(get_label("data_fault_handler", hart), instr);
+  endfunction
+
   virtual function void gen_illegal_instr_handler(int hart);
     string instr[$];
     gen_signature_handshake(instr, CORE_STATUS, ILLEGAL_INSTR_EXCEPTION);
