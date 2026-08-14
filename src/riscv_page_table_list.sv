@@ -377,12 +377,30 @@ class riscv_page_table_list#(satp_mode_t MODE = SV39) extends uvm_object;
     // Make sure all outstanding memory access is completed
     instr.push_back("sfence.vma");
     // Randomly decide if run some kernel program before exiting from exception handling
-    // Use the low 2 bits of x30 to determine whether to skip it or not.
-    instr.push_back($sformatf("slli x30, x30, %0d", XLEN - 2));
-    instr.push_back("beqz x30, fix_pte_ret");
+    // Use the low 2 bits of a scratch register to determine whether to skip it.
+    //
+    // These were the only hardcoded GPR literals in all of riscv-dv's generated
+    // code (x30/x31), and the shift *destroys* the register it samples. When
+    // cfg.tp was drawn as x30, `slli tp, tp, XLEN-2` on an 8-aligned kernel stack
+    // pointer produced exactly 0; fix_pte_ret then ran pop_gpr_from_kernel_stack,
+    // whose first instruction is `add sp, tp, zero`, so sp became 0 too and the
+    // handler faulted on its own prologue forever. Measured: with boot_mode=s/u
+    // and tp in {x30,x31}, 7 of 8 tests livelocked and burned the whole cycle
+    // budget.
+    //
+    // tmp_reg and mask_reg are constrained to exclude cfg.reserved_regs (which
+    // holds tp, sp and scratch) and ZERO, and both are overwritten a few
+    // instructions below, so sampling and clobbering them here is free.
+    instr.push_back($sformatf("slli x%0d, x%0d, %0d", tmp_reg, tmp_reg, XLEN - 2));
+    instr.push_back($sformatf("beqz x%0d, fix_pte_ret", tmp_reg));
     // Randomly decide if set MPRV to 1
-    instr.push_back($sformatf("slli x31, x31, %0d", XLEN - 2));
-    instr.push_back("beqz x30, check_mprv");
+    // NOTE: the branch below reads tmp_reg, not the register just shifted - that
+    // is upstream's behaviour, preserved deliberately. It means check_mprv is
+    // unreachable once the first branch falls through. Changing it would alter
+    // what this handler exercises, which is a separate question from the
+    // register collision fixed above.
+    instr.push_back($sformatf("slli x%0d, x%0d, %0d", mask_reg, mask_reg, XLEN - 2));
+    instr.push_back($sformatf("beqz x%0d, check_mprv", tmp_reg));
     instr.push_back($sformatf("csrr x%0d, 0x%0x", tmp_reg, MSTATUS));
     instr.push_back($sformatf("li x%0d, 0x%0x", mask_reg, MPRV_BIT_MASK));
     instr.push_back($sformatf("not x%0d, x%0d", mask_reg, mask_reg));
