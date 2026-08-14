@@ -1496,11 +1496,36 @@ package riscv_instr_pkg;
   endfunction
 
   // Get a hex argument from command line
+  // str.atohex() returns `integer` - 32 bits, signed (IEEE 1800-2017 6.16). Any
+  // value with bit 31 set is therefore both truncated and sign-extended when
+  // assigned to an XLEN-wide target. Parse the full width instead.
+  function automatic bit [XLEN - 1 : 0] atohex_xlen(string s);
+    bit [XLEN - 1 : 0] value = '0;
+    int unsigned i = 0;
+    byte c;
+    if (s.len() > 2 && (s.substr(0, 1) == "0x" || s.substr(0, 1) == "0X")) begin
+      i = 2;
+    end
+    for (; i < s.len(); i++) begin
+      c = s[i];
+      if (c >= "0" && c <= "9") begin
+        value = (value << 4) | (c - "0");
+      end else if (c >= "a" && c <= "f") begin
+        value = (value << 4) | (c - "a" + 10);
+      end else if (c >= "A" && c <= "F") begin
+        value = (value << 4) | (c - "A" + 10);
+      end else begin
+        break;
+      end
+    end
+    return value;
+  endfunction
+
   function automatic void get_hex_arg_value(string cmdline_str,
                                             ref bit [XLEN - 1 : 0] val);
     string s;
     if(inst.get_arg_value(cmdline_str, s)) begin
-      val = s.atohex();
+      val = atohex_xlen(s);
     end
   endfunction
 
@@ -1546,13 +1571,12 @@ package riscv_instr_pkg;
   function automatic void get_val(input string str, output bit [XLEN-1:0] val, input hex = 0);
     if (str.len() > 2) begin
       if (str.substr(0, 1) == "0x") begin
-        str = str.substr(2, str.len() -1);
-        val = str.atohex();
+        val = atohex_xlen(str);
         return;
       end
     end
     if (hex) begin
-      val = str.atohex();
+      val = atohex_xlen(str);
     end else begin
       if (str.substr(0, 0) == "-") begin
         str = str.substr(1, str.len() - 1);

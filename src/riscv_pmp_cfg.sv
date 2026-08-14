@@ -341,7 +341,7 @@ class riscv_pmp_cfg extends uvm_object;
           // Don't have to convert address to "PMP format" here,
           // since it must be masked off in hardware
           return_value.addr_valid = 1'b1;
-          return_value.pmp_cfg_reg.addr = format_addr(field_val.atohex());
+          return_value.pmp_cfg_reg.addr = format_addr(atohex_xlen(field_val));
         end
         default: begin
           `uvm_fatal(`gfn, $sformatf("%s, Invalid PMP configuration field name!", field_val))
