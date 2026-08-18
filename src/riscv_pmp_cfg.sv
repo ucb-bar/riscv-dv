@@ -22,6 +22,15 @@ class riscv_pmp_cfg extends uvm_object;
   // default to granularity of 0 (4 bytes grain)
   int pmp_granularity = 0;
 
+  // PMP checks physical addresses, but mtval/mepc hold virtual ones whenever
+  // translation is on. riscv_page_table_list maps VA v -> PA v + start_pa
+  // ('h8000_0000) for the whole image, so the exception routine has to undo that
+  // before it can compare a faulting address against a pmpaddr CSR, load the
+  // faulting instruction, or compare mepc against <main>. Set this to start_pa
+  // (+pmp_va_offset=0x80000000) whenever boot_mode is s or u with SATP_MODE !=
+  // BARE. Left at 0 - the default - not a single generated instruction changes.
+  bit [XLEN - 1 : 0] pmp_va_offset = 0;
+
   // number of configuration bytes per pmpcfg CSR
   int cfg_per_csr;
 
@@ -205,6 +214,7 @@ class riscv_pmp_cfg extends uvm_object;
       pmp_num_regions.rand_mode(0);
     end
     get_int_arg_value("+pmp_granularity=", pmp_granularity);
+    get_hex_arg_value("+pmp_va_offset=", pmp_va_offset);
     get_bool_arg_value("+pmp_randomize=", pmp_randomize);
     get_bool_arg_value("+pmp_allow_illegal_tor=", pmp_allow_illegal_tor);
     get_bool_arg_value("+suppress_pmp_setup=", suppress_pmp_setup);
@@ -341,7 +351,7 @@ class riscv_pmp_cfg extends uvm_object;
           // Don't have to convert address to "PMP format" here,
           // since it must be masked off in hardware
           return_value.addr_valid = 1'b1;
-          return_value.pmp_cfg_reg.addr = format_addr(field_val.atohex());
+          return_value.pmp_cfg_reg.addr = format_addr(atohex_xlen(field_val));
         end
         default: begin
           `uvm_fatal(`gfn, $sformatf("%s, Invalid PMP configuration field name!", field_val))
@@ -641,6 +651,15 @@ class riscv_pmp_cfg extends uvm_object;
     end
   endfunction
 
+  // Turn a virtual address held in `reg_addr` into the physical address PMP actually
+  // checks, using `tmp` as scratch. Emits nothing at all when pmp_va_offset is 0, which
+  // is the case for every machine-mode configuration.
+  function void gen_pmp_va_to_pa(riscv_reg_t reg_addr, riscv_reg_t tmp, ref string instr[$]);
+    if (pmp_va_offset == 0) return;
+    instr.push_back($sformatf("li x%0d, 0x%0x", tmp, pmp_va_offset));
+    instr.push_back($sformatf("add x%0d, x%0d, x%0d", reg_addr, reg_addr, tmp));
+  endfunction
+
   // This function creates a special PMP exception routine that is generated within the
   // instr_fault, load_fault, and store_fault exception routines to prevent infinite loops.
   // This routine will first find the correct pmpcfg CSR that corresponds to the address that
@@ -803,9 +822,21 @@ class riscv_pmp_cfg extends uvm_object;
     instr = {instr, "20: j 18b"};
 
     // Sub-section to handle address matching mode TOR.
+    // Every scratch_reg is live from here to the match, so converting mtval needs the
+    // one holding the loop counter - hence the reordering, which only happens when a
+    // conversion is actually emitted.
+    if (pmp_va_offset == 0) begin
+      instr = {instr,
+               $sformatf("21: mv x%0d, x%0d", scratch_reg[0], scratch_reg[6]),
+               $sformatf("csrr x%0d, 0x%0x", scratch_reg[4], MTVAL)};
+    end else begin
+      instr = {instr,
+               $sformatf("21: csrr x%0d, 0x%0x", scratch_reg[4], MTVAL)};
+      // mtval is a virtual address when translation is on; pmpaddr is physical.
+      gen_pmp_va_to_pa(scratch_reg[4], scratch_reg[0], instr);
+      instr.push_back($sformatf("mv x%0d, x%0d", scratch_reg[0], scratch_reg[6]));
+    end
     instr = {instr,
-             $sformatf("21: mv x%0d, x%0d", scratch_reg[0], scratch_reg[6]),
-             $sformatf("csrr x%0d, 0x%0x", scratch_reg[4], MTVAL),
              $sformatf("srli x%0d, x%0d, 2", scratch_reg[4], scratch_reg[4]),
              // If loop_counter==0, compare fault_addr to 0
              $sformatf("bnez x%0d, 22f", scratch_reg[0]),
@@ -822,7 +853,9 @@ class riscv_pmp_cfg extends uvm_object;
     // Sub-section to handle address matching mode NA4.
     // TODO(udinator) : add rv64 support
     instr = {instr,
-             $sformatf("24: csrr x%0d, 0x%0x", scratch_reg[0], MTVAL),
+             $sformatf("24: csrr x%0d, 0x%0x", scratch_reg[0], MTVAL)};
+    gen_pmp_va_to_pa(scratch_reg[0], scratch_reg[4], instr);
+    instr = {instr,
              $sformatf("srli x%0d, x%0d, 2", scratch_reg[0], scratch_reg[0]),
              // Zero out pmpaddr[i][31:30]
              $sformatf("slli x%0d, x%0d, 2", scratch_reg[4], scratch_reg[1]),
@@ -835,7 +868,9 @@ class riscv_pmp_cfg extends uvm_object;
 
     // Sub-section to handle address matching mode NAPOT.
     instr = {instr,
-             $sformatf("25: csrr x%0d, 0x%0x", scratch_reg[0], MTVAL),
+             $sformatf("25: csrr x%0d, 0x%0x", scratch_reg[0], MTVAL)};
+    gen_pmp_va_to_pa(scratch_reg[0], scratch_reg[4], instr);
+    instr = {instr,
              // get fault_addr[31:2]
              $sformatf("srli x%0d, x%0d, 2", scratch_reg[0], scratch_reg[0]),
              // mask the bottom pmp_granularity bits of fault_addr
@@ -891,7 +926,11 @@ class riscv_pmp_cfg extends uvm_object;
         instr = {instr,
                  // If MML or locked try to load the instruction and see if it is compressed so
                  // the MEPC can be advanced appropriately.
-                 $sformatf("27: csrr x%0d, 0x%0x", scratch_reg[0], MEPC),
+                 $sformatf("27: csrr x%0d, 0x%0x", scratch_reg[0], MEPC)};
+        // The load below is issued in M-mode with MPRV=0, so it is physical, while mepc
+        // is virtual whenever translation is on.
+        gen_pmp_va_to_pa(scratch_reg[0], scratch_reg[4], instr);
+        instr = {instr,
                  // This might cause a load access fault, which we much handle in the load trap
                  // handler.
                  $sformatf("lw x%0d, 0(x%0d)", scratch_reg[0], scratch_reg[0]),
@@ -920,7 +959,11 @@ class riscv_pmp_cfg extends uvm_object;
         instr = {instr,
                  // If MML or locked try to load the instruction and see if it is compressed so
                  // the MEPC can be advanced appropriately.
-                 $sformatf("27: csrr x%0d, 0x%0x", scratch_reg[0], MEPC),
+                 $sformatf("27: csrr x%0d, 0x%0x", scratch_reg[0], MEPC)};
+        // <main> is a link-time (physical) address and the load below is physical, but
+        // mepc is virtual whenever translation is on.
+        gen_pmp_va_to_pa(scratch_reg[0], scratch_reg[4], instr);
+        instr = {instr,
                  // We must first check whether the access fault was in the trap handler in case
                  // we previously tried to load an instruction in a PMP entry that did not have
                  // read permissions.
@@ -991,12 +1034,26 @@ class riscv_pmp_cfg extends uvm_object;
              $sformatf("li x%0d, 3", scratch_reg[4]),
              $sformatf("beq x%0d, x%0d, 33f", scratch_reg[0], scratch_reg[4]),
              $sformatf("30: csrw 0x%0x, x%0d", PMPCFG0, scratch_reg[2]),
-             $sformatf("j 34f"),
+             $sformatf("j 35f"),
              $sformatf("31: csrw 0x%0x, x%0d", PMPCFG1, scratch_reg[2]),
-             $sformatf("j 34f"),
+             $sformatf("j 35f"),
              $sformatf("32: csrw 0x%0x, x%0d", PMPCFG2, scratch_reg[2]),
-             $sformatf("j 34f"),
-             $sformatf("33: csrw 0x%0x, x%0d", PMPCFG3, scratch_reg[2]),
+             $sformatf("j 35f"),
+             $sformatf("33: csrw 0x%0x, x%0d", PMPCFG3, scratch_reg[2])
+            };
+    // A hart is permitted to cache the PMP decision alongside the address translation it
+    // was made for, and rocket-chip does exactly that: TLB.scala latches prot_r / prot_w
+    // / prot_x into the TLB entry at refill time. So with translation on, loosening a
+    // pmpcfg here has no effect on any access that already has a TLB entry - which is
+    // precisely the access we are trying to let through. Without this fence the DUT
+    // keeps faulting while a golden model that re-checks PMP on every access does not,
+    // and that shows up as a lockstep divergence rather than as a real disagreement.
+    // Unconditional, and deliberately not gated on pmp_va_offset: the privileged
+    // spec requires the fence on any hart that *implements* page-based virtual
+    // memory, "even if VM is not currently enabled", so a machine-mode-only test
+    // on a core that has SV39 needs it just as much as an S/U one.
+    instr.push_back("35: sfence.vma");
+    instr = {instr,
              // End the pmp handler with a labeled nop instruction, this provides a branch target
              // for the internal routine after it has "fixed" the pmp configuration CSR.
              $sformatf("34: nop")
